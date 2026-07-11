@@ -8,15 +8,24 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import base64
+import binascii
 import contextvars
+import copy
+import hashlib
+import json
 import logging
 import os
 import re
+import select
 import sys
 import threading
 import time
 import unicodedata
-from typing import Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
 from hermes_cli.config import cfg_get
 
 from utils import is_truthy_value
@@ -948,6 +957,340 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
+# =========================================================================
+# External exact-once approval protocol (NLS-184)
+# =========================================================================
+
+_EXTERNAL_PROTOCOL = "hermes.external-approval"
+_EXTERNAL_VERSION = 1
+_EXTERNAL_OPERATION_KIND = "terminal.command"
+_EXTERNAL_TOOL_IDENTITY = "terminal"
+_EXTERNAL_MODE_ENV = "HERMES_EXTERNAL_APPROVAL_MODE"
+_EXTERNAL_MODE_VALUE = "exact-once"
+_EXTERNAL_GRANT_CHOICE = "approve_once"
+_EXTERNAL_GRANT_ALGORITHM = "Ed25519"
+
+
+@dataclass(frozen=True)
+class _ExternalApprovalFdProtocol:
+    grant_input_fd: int
+    record_output_fd: int
+    verification_key: bytes
+
+
+_external_fd_protocol: Optional[_ExternalApprovalFdProtocol] = None
+_grant_read_buffer = bytearray()
+
+
+def _canonical_protocol_record(value: dict) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _operation_fingerprint(command: str) -> str:
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def _build_approval_id(*, operation: dict, session: dict) -> str:
+    payload = _canonical_protocol_record({
+        "kind": "request",
+        "operation": operation,
+        "protocol": _EXTERNAL_PROTOCOL,
+        "session": session,
+        "version": _EXTERNAL_VERSION,
+    })
+    return "appr_v1_" + hashlib.sha256(payload).hexdigest()[:16]
+
+
+def build_external_approval_request(
+    *,
+    command: str,
+    operation_kind: str,
+    tool_identity: str,
+    session_id: str,
+    profile: str,
+) -> dict:
+    """Build the unsigned external approval request record for *command*."""
+    operation = {
+        "kind": operation_kind,
+        "tool": tool_identity,
+        "fingerprint": _operation_fingerprint(command),
+    }
+    session = {"id": session_id, "profile": profile}
+    return {
+        "protocol": _EXTERNAL_PROTOCOL,
+        "version": _EXTERNAL_VERSION,
+        "kind": "request",
+        "approval_id": _build_approval_id(operation=operation, session=session),
+        "operation": operation,
+        "session": session,
+    }
+
+
+def configure_external_approval_fd_protocol(
+    *,
+    grant_input_fd: int,
+    record_output_fd: int,
+    verification_key: bytes,
+) -> None:
+    """Wire the headless external approval transport for this process."""
+    global _external_fd_protocol, _grant_read_buffer
+    for fd in (grant_input_fd, record_output_fd):
+        try:
+            os.set_inheritable(fd, False)
+        except (AttributeError, OSError):
+            pass
+    _grant_read_buffer = bytearray()
+    _external_fd_protocol = _ExternalApprovalFdProtocol(
+        grant_input_fd=grant_input_fd,
+        record_output_fd=record_output_fd,
+        verification_key=verification_key,
+    )
+
+
+def clear_external_approval_fd_protocol() -> None:
+    """Tear down the external approval transport for this process."""
+    global _external_fd_protocol, _grant_read_buffer
+    _external_fd_protocol = None
+    _grant_read_buffer = bytearray()
+
+
+def external_approval_tool_subprocess_kwargs() -> dict:
+    """Subprocess kwargs that keep protocol FDs out of tool child processes."""
+    return {"close_fds": True, "pass_fds": ()}
+
+
+def _is_external_exact_once_active() -> bool:
+    if _external_fd_protocol is None:
+        return False
+    if not is_truthy_value(os.getenv("HERMES_EXEC_ASK")):
+        return False
+    return os.getenv(_EXTERNAL_MODE_ENV) == _EXTERNAL_MODE_VALUE
+
+
+def _external_consumed_store_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / ".external-approval" / "consumed.json"
+
+
+def _load_consumed_approval_ids() -> set[str]:
+    path = _external_consumed_store_path()
+    if not path.exists():
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+    approval_ids = payload.get("approval_ids", [])
+    if not isinstance(approval_ids, list):
+        return set()
+    return {item for item in approval_ids if isinstance(item, str)}
+
+
+def _persist_consumed_approval_id(approval_id: str) -> bool:
+    path = _external_consumed_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        consumed = _load_consumed_approval_ids()
+        if approval_id in consumed:
+            return False
+        consumed.add(approval_id)
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump({"approval_ids": sorted(consumed)}, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except OSError:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            return False
+    return True
+
+
+def _write_protocol_record(record: dict) -> bool:
+    protocol = _external_fd_protocol
+    if protocol is None:
+        return False
+    payload = _canonical_protocol_record(record) + b"\n"
+    try:
+        written = os.write(protocol.record_output_fd, payload)
+    except OSError:
+        return False
+    return written == len(payload)
+
+
+def _parse_protocol_object_strict(raw: bytes) -> Optional[dict]:
+    duplicates: list[str] = []
+
+    def _object_pairs_hook(pairs: list[tuple[str, Any]]) -> dict:
+        seen: set[str] = set()
+        obj: dict = {}
+        for key, value in pairs:
+            if key in seen:
+                duplicates.append(key)
+            seen.add(key)
+            obj[key] = value
+        return obj
+
+    try:
+        parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_object_pairs_hook)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+    if duplicates or not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _try_read_grant_line() -> Optional[dict]:
+    global _grant_read_buffer
+    protocol = _external_fd_protocol
+    if protocol is None:
+        return None
+
+    while b"\n" not in _grant_read_buffer:
+        ready, _, _ = select.select([protocol.grant_input_fd], [], [], 0)
+        if not ready:
+            return None
+        try:
+            chunk = os.read(protocol.grant_input_fd, 65536)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        _grant_read_buffer.extend(chunk)
+
+    raw, _, remainder = _grant_read_buffer.partition(b"\n")
+    _grant_read_buffer = bytearray(remainder)
+    return _parse_protocol_object_strict(raw)
+
+
+def _validate_external_grant(grant: dict, request: dict) -> bool:
+    protocol = _external_fd_protocol
+    if protocol is None:
+        return False
+
+    required_top = (
+        "protocol", "version", "kind", "algorithm", "approval_id",
+        "operation", "session", "issued_at", "expires_at", "choice", "signature",
+    )
+    if any(key not in grant for key in required_top):
+        return False
+    if grant.get("protocol") != _EXTERNAL_PROTOCOL:
+        return False
+    if grant.get("version") != _EXTERNAL_VERSION:
+        return False
+    if grant.get("kind") != "grant":
+        return False
+    if grant.get("algorithm") != _EXTERNAL_GRANT_ALGORITHM:
+        return False
+    if grant.get("choice") != _EXTERNAL_GRANT_CHOICE:
+        return False
+
+    operation = grant.get("operation")
+    session = grant.get("session")
+    if not isinstance(operation, dict) or not isinstance(session, dict):
+        return False
+    for key in ("fingerprint", "kind", "tool"):
+        if operation.get(key) != request["operation"].get(key):
+            return False
+    for key in ("id", "profile"):
+        if session.get(key) != request["session"].get(key):
+            return False
+    if grant.get("approval_id") != request.get("approval_id"):
+        return False
+
+    try:
+        issued_at = int(grant["issued_at"])
+        expires_at = int(grant["expires_at"])
+    except (TypeError, ValueError):
+        return False
+    now = int(time.time())
+    if issued_at > now or expires_at < now:
+        return False
+
+    signature_b64 = grant.get("signature")
+    if not isinstance(signature_b64, str) or not signature_b64:
+        return False
+    try:
+        signature = base64.b64decode(signature_b64, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if len(signature) != 64:
+        return False
+
+    signed_payload = copy.deepcopy(grant)
+    signed_payload.pop("signature", None)
+    message = _canonical_protocol_record(signed_payload)
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        Ed25519PublicKey.from_public_bytes(protocol.verification_key).verify(
+            signature, message
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _build_external_receipt(grant: dict) -> dict:
+    return {
+        "protocol": _EXTERNAL_PROTOCOL,
+        "version": _EXTERNAL_VERSION,
+        "kind": "receipt",
+        "approval_id": grant["approval_id"],
+        "operation": dict(grant["operation"]),
+        "session": dict(grant["session"]),
+        "choice": _EXTERNAL_GRANT_CHOICE,
+        "consumed_at": int(time.time()),
+    }
+
+
+def _external_exact_once_guard(command: str) -> dict:
+    from hermes_constants import get_hermes_home
+
+    session_id = get_current_session_key()
+    profile = str(get_hermes_home())
+    request = build_external_approval_request(
+        command=command,
+        operation_kind=_EXTERNAL_OPERATION_KIND,
+        tool_identity=_EXTERNAL_TOOL_IDENTITY,
+        session_id=session_id,
+        profile=profile,
+    )
+
+    grant = _try_read_grant_line()
+    if grant is not None and _validate_external_grant(grant, request):
+        approval_id = grant["approval_id"]
+        if approval_id not in _load_consumed_approval_ids():
+            if _persist_consumed_approval_id(approval_id):
+                receipt = _build_external_receipt(grant)
+                if _write_protocol_record(receipt):
+                    return {"approved": True, "message": None, "external_approval": "consumed"}
+                return {
+                    "approved": False,
+                    "message": None,
+                    "external_approval": "receipt_failed",
+                }
+
+    if not _write_protocol_record(request):
+        return {"approved": False, "message": None, "external_approval": "record_failed"}
+
+    if grant is not None:
+        return {"approved": False, "message": None, "external_approval": "invalid_grant"}
+
+    return {"approved": False, "message": None, "external_approval": "awaiting_grant"}
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
@@ -969,6 +1312,9 @@ def check_all_command_guards(command: str, env_type: str,
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
+
+    if _is_external_exact_once_active():
+        return _external_exact_once_guard(command)
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
